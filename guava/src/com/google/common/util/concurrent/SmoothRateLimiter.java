@@ -27,120 +27,6 @@ import java.util.concurrent.TimeUnit;
  */
 @GwtIncompatible
 abstract class SmoothRateLimiter extends RateLimiter {
-  /*
-   * How is the RateLimiter designed, and why?
-   *
-   * The primary feature of a RateLimiter is its "stable rate", the maximum rate that is should
-   * allow at normal conditions. This is enforced by "throttling" incoming requests as needed, i.e.
-   * compute, for an incoming request, the appropriate throttle time, and make the calling thread
-   * wait as much.
-   *
-   * The simplest way to maintain a rate of QPS is to keep the timestamp of the last granted
-   * request, and ensure that (1/QPS) seconds have elapsed since then. For example, for a rate of
-   * QPS=5 (5 tokens per second), if we ensure that a request isn't granted earlier than 200ms after
-   * the last one, then we achieve the intended rate. If a request comes and the last request was
-   * granted only 100ms ago, then we wait for another 100ms. At this rate, serving 15 fresh permits
-   * (i.e. for an acquire(15) request) naturally takes 3 seconds.
-   *
-   * It is important to realize that such a RateLimiter has a very superficial memory of the past:
-   * it only remembers the last request. What if the RateLimiter was unused for a long period of
-   * time, then a request arrived and was immediately granted? This RateLimiter would immediately
-   * forget about that past underutilization. This may result in either underutilization or
-   * overflow, depending on the real world consequences of not using the expected rate.
-   *
-   * Past underutilization could mean that excess resources are available. Then, the RateLimiter
-   * should speed up for a while, to take advantage of these resources. This is important when the
-   * rate is applied to networking (limiting bandwidth), where past underutilization typically
-   * translates to "almost empty buffers", which can be filled immediately.
-   *
-   * On the other hand, past underutilization could mean that "the server responsible for handling
-   * the request has become less ready for future requests", i.e. its caches become stale, and
-   * requests become more likely to trigger expensive operations (a more extreme case of this
-   * example is when a server has just booted, and it is mostly busy with getting itself up to
-   * speed).
-   *
-   * To deal with such scenarios, we add an extra dimension, that of "past underutilization",
-   * modeled by "storedPermits" variable. This variable is zero when there is no underutilization,
-   * and it can grow up to maxStoredPermits, for sufficiently large underutilization. So, the
-   * requested permits, by an invocation acquire(permits), are served from:
-   *
-   * - stored permits (if available)
-   *
-   * - fresh permits (for any remaining permits)
-   *
-   * How this works is best explained with an example:
-   *
-   * For a RateLimiter that produces 1 token per second, every second that goes by with the
-   * RateLimiter being unused, we increase storedPermits by 1. Say we leave the RateLimiter unused
-   * for 10 seconds (i.e., we expected a request at time X, but we are at time X + 10 seconds before
-   * a request actually arrives; this is also related to the point made in the last paragraph), thus
-   * storedPermits becomes 10.0 (assuming maxStoredPermits >= 10.0). At that point, a request of
-   * acquire(3) arrives. We serve this request out of storedPermits, and reduce that to 7.0 (how
-   * this is translated to throttling time is discussed later). Immediately after, assume that an
-   * acquire(10) request arriving. We serve the request partly from storedPermits, using all the
-   * remaining 7.0 permits, and the remaining 3.0, we serve them by fresh permits produced by the
-   * rate limiter.
-   *
-   * We already know how much time it takes to serve 3 fresh permits: if the rate is
-   * "1 token per second", then this will take 3 seconds. But what does it mean to serve 7 stored
-   * permits? As explained above, there is no unique answer. If we are primarily interested to deal
-   * with underutilization, then we want stored permits to be given out /faster/ than fresh ones,
-   * because underutilization = free resources for the taking. If we are primarily interested to
-   * deal with overflow, then stored permits could be given out /slower/ than fresh ones. Thus, we
-   * require a (different in each case) function that translates storedPermits to throtting time.
-   *
-   * This role is played by storedPermitsToWaitTime(double storedPermits, double permitsToTake). The
-   * underlying model is a continuous function mapping storedPermits (from 0.0 to maxStoredPermits)
-   * onto the 1/rate (i.e. intervals) that is effective at the given storedPermits. "storedPermits"
-   * essentially measure unused time; we spend unused time buying/storing permits. Rate is
-   * "permits / time", thus "1 / rate = time / permits". Thus, "1/rate" (time / permits) times
-   * "permits" gives time, i.e., integrals on this function (which is what storedPermitsToWaitTime()
-   * computes) correspond to minimum intervals between subsequent requests, for the specified number
-   * of requested permits.
-   *
-   * Here is an example of storedPermitsToWaitTime: If storedPermits == 10.0, and we want 3 permits,
-   * we take them from storedPermits, reducing them to 7.0, and compute the throttling for these as
-   * a call to storedPermitsToWaitTime(storedPermits = 10.0, permitsToTake = 3.0), which will
-   * evaluate the integral of the function from 7.0 to 10.0.
-   *
-   * Using integrals guarantees that the effect of a single acquire(3) is equivalent to {
-   * acquire(1); acquire(1); acquire(1); }, or { acquire(2); acquire(1); }, etc, since the integral
-   * of the function in [7.0, 10.0] is equivalent to the sum of the integrals of [7.0, 8.0], [8.0,
-   * 9.0], [9.0, 10.0] (and so on), no matter what the function is. This guarantees that we handle
-   * correctly requests of varying weight (permits), /no matter/ what the actual function is - so we
-   * can tweak the latter freely. (The only requirement, obviously, is that we can compute its
-   * integrals).
-   *
-   * Note well that if, for this function, we chose a horizontal line, at height of exactly (1/QPS),
-   * then the effect of the function is non-existent: we serve storedPermits at exactly the same
-   * cost as fresh ones (1/QPS is the cost for each). We use this trick later.
-   *
-   * If we pick a function that goes /below/ that horizontal line, it means that we reduce the area
-   * of the function, thus time. Thus, the RateLimiter becomes /faster/ after a period of
-   * underutilization. If, on the other hand, we pick a function that goes /above/ that horizontal
-   * line, then it means that the area (time) is increased, thus storedPermits are more costly than
-   * fresh permits, thus the RateLimiter becomes /slower/ after a period of underutilization.
-   *
-   * Last, but not least: consider a RateLimiter with rate of 1 permit per second, currently
-   * completely unused, and an expensive acquire(100) request comes. It would be nonsensical to just
-   * wait for 100 seconds, and /then/ start the actual task. Why wait without doing anything? A much
-   * better approach is to /allow/ the request right away (as if it was an acquire(1) request
-   * instead), and postpone /subsequent/ requests as needed. In this version, we allow starting the
-   * task immediately, and postpone by 100 seconds future requests, thus we allow for work to get
-   * done in the meantime instead of waiting idly.
-   *
-   * This has important consequences: it means that the RateLimiter doesn't remember the time of the
-   * _last_ request, but it remembers the (expected) time of the _next_ request. This also enables
-   * us to tell immediately (see tryAcquire(timeout)) whether a particular timeout is enough to get
-   * us to the point of the next scheduling time, since we always maintain that. And what we mean by
-   * "an unused RateLimiter" is also defined by that notion: when we observe that the
-   * "expected arrival time of the next request" is actually in the past, then the difference (now -
-   * past) is the amount of time that the RateLimiter was formally unused, and it is that amount of
-   * time which we translate to storedPermits. (We increase storedPermits with the amount of permits
-   * that would have been produced in that idle time). So, if rate == 1 permit per second, and
-   * arrivals come exactly one second after the previous, then storedPermits is _never_ increased --
-   * we would only increase it for arrivals _later_ than the expected one second.
-   */
 
   /**
    * This implements the following function where coldInterval = coldFactor * stableInterval.
@@ -158,54 +44,22 @@ abstract class SmoothRateLimiter extends RateLimiter {
    *          |           /      .
    *   stable +----------/  WARM .
    * interval |          .   UP  .
-   *          |          . PERIOD.
+   *          |   stable . PERIOD.
    *          |          .       .
    *        0 +----------+-------+--------------→ storedPermits
    *          0 thresholdPermits maxPermits
    * </pre>
    *
-   * Before going into the details of this particular function, let's keep in mind the basics:
    *
-   * <ol>
-   *   <li>The state of the RateLimiter (storedPermits) is a vertical line in this figure.
-   *   <li>When the RateLimiter is not used, this goes right (up to maxPermits)
-   *   <li>When the RateLimiter is used, this goes left (down to zero), since if we have
-   *       storedPermits, we serve from those first
-   *   <li>When _unused_, we go right at a constant rate! The rate at which we move to the right is
-   *       chosen as maxPermits / warmupPeriod. This ensures that the time it takes to go from 0 to
-   *       maxPermits is equal to warmupPeriod.
-   *   <li>When _used_, the time it takes, as explained in the introductory class note, is equal to
-   *       the integral of our function, between X permits and X-K permits, assuming we want to
-   *       spend K saved permits.
-   * </ol>
-   *
-   * <p>In summary, the time it takes to move to the left (spend K permits), is equal to the area of
-   * the function of width == K.
-   *
-   * <p>Assuming we have saturated demand, the time to go from maxPermits to thresholdPermits is
-   * equal to warmupPeriod. And the time to go from thresholdPermits to 0 is warmupPeriod/2. (The
-   * reason that this is warmupPeriod/2 is to maintain the behavior of the original implementation
-   * where coldFactor was hard coded as 3.)
-   *
-   * <p>It remains to calculate thresholdsPermits and maxPermits.
-   *
-   * <ul>
-   *   <li>The time to go from thresholdPermits to 0 is equal to the integral of the function
-   *       between 0 and thresholdPermits. This is thresholdPermits * stableIntervals. By (5) it is
-   *       also equal to warmupPeriod/2. Therefore
-   *       <blockquote>
-   *       thresholdPermits = 0.5 * warmupPeriod / stableInterval
-   *       </blockquote>
-   *
-   *   <li>The time to go from maxPermits to thresholdPermits is equal to the integral of the
-   *       function between thresholdPermits and maxPermits. This is the area of the pictured
-   *       trapezoid, and it is equal to 0.5 * (stableInterval + coldInterval) * (maxPermits -
-   *       thresholdPermits). It is also equal to warmupPeriod, so
-   *       <blockquote>
-   *       maxPermits = thresholdPermits + 2 * warmupPeriod / (stableInterval + coldInterval)
-   *       </blockquote>
-   *
-   * </ul>
+   * 1、图中有两个阴影面积，一个用 stable，另外一个warm up period。在预热算法中，这两个阴影面积的关系与冷却因子相关。
+   * 2、冷却因子 coldFactor 表示的含义为 coldInterval 与 stableInterval 的比值。
+   * 3、warm up period 阴影面积 与 stable 阴影面积的比值等于 (coldInterval - stableInterval ) / stableInterval ，
+   * 例如 SmoothWarmingUp 固定的冷却因子为3，那么 coldInterval 与 stableInterval 的比值为 3，
+   * 那 (coldInterval - stableInterval ) / stableInterval 则为 2。
+   * 4、在预热算法中与数学中的积分相关（笔者对这方面的数学知识一窍不通），故这里只展示结论，而不做推导，
+   * 若阴影 WARM UP PERIOD 的面积等于 warmupPeriod,那阴影stable的面积等于 warmupPeriod/2。
+   * 5、存在如下等式 warmupPeriod/2 = thresholdPermits * stableIntervalMicros (长方形的面积)
+   *   同样存在如下等式 warmupPeriod = 0.5 * (stableInterval + coldInterval) * (maxPermits - thresholdPermits) （梯形面积，(上底 + 下底 * 高 / 2) ）
    */
 
 
@@ -231,12 +85,22 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
     @Override
     void doSetRate(double permitsPerSecond, double stableIntervalMicros) {
+      /**
+       *  double permitsPerSecond, 每秒的许可数
+       *  double stableIntervalMicros：稳定的获取一个许可的时间
+       */
       double oldMaxPermits = maxPermits;
+      //根据冷却因子来计算冷却间隔  冷却因子 coldFactor 为 冷却间隔与稳定间隔的比例
       double coldIntervalMicros = stableIntervalMicros * coldFactor;
+      //通过 warmupPeriod/2 = thresholdPermits * stableIntervalMicros 等式，求出 thresholdPermits 的值。
       thresholdPermits = 0.5 * warmupPeriodMicros / stableIntervalMicros;
+      //根据 warmupPeriod = 0.5 * (stableInterval + coldInterval) * (maxPermits - thresholdPermits) 表示可求出 maxPermits 的数量。
       maxPermits =
           thresholdPermits + 2.0 * warmupPeriodMicros / (stableIntervalMicros + coldIntervalMicros);
+      //斜率，表示的是从 stableIntervalMicros 到 coldIntervalMicros 这段时间，许可数量从 thresholdPermits 变为 maxPermits 的增长速率。
       slope = (coldIntervalMicros - stableIntervalMicros) / (maxPermits - thresholdPermits);
+
+      //根据 maxPermits 更新当前存储的许可，即当前剩余可消耗的许可数量。
       if (oldMaxPermits == Double.POSITIVE_INFINITY) {
         // if we don't special-case this, we would get storedPermits == NaN, below
         storedPermits = 0.0;
@@ -250,28 +114,52 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
     @Override
     long storedPermitsToWaitTime(double storedPermits, double permitsToTake) {
+      /**
+       * double storedPermits：当前存储的许可数量。
+       * double permitsToTake：本次申请需要的许可数量。
+       */
+
+      /**
+       * availablePermitsAboveThreshold ，当前超出 thresholdPermits 的许可个数，
+       * 如果超过 thresholdPermits ，申请许可将来源于超过的部分，只有其不足后，才会从 thresholdPermits 中申请
+       */
       double availablePermitsAboveThreshold = storedPermits - thresholdPermits;
       long micros = 0;
       // measuring the integral on the right part of the function (the climbing line)
+      /**
+       * 如果当前存储的许可数量超过了稳定许可 thresholdPermits  即存在预热的许可数量的申请逻辑
+       */
       if (availablePermitsAboveThreshold > 0.0) {
+        //取超出的部分和本次申请需要的许可数量较小的那个
         double permitsAboveThresholdToTake = min(availablePermitsAboveThreshold, permitsToTake);
         // TODO(cpovirk): Figure out a good name for this variable.
+        //
         double length = permitsToTime(availablePermitsAboveThreshold)
                 + permitsToTime(availablePermitsAboveThreshold - permitsAboveThresholdToTake);
+
         micros = (long) (permitsAboveThresholdToTake * length / 2.0);
         permitsToTake -= permitsAboveThresholdToTake;
       }
       // measuring the integral on the left part of the function (the horizontal line)
+      /**
+       * ：从稳定区间获取一个许可的时间，就容易理解，为固定的 stableIntervalMicros 。
+       */
       micros += (stableIntervalMicros * permitsToTake);
       return micros;
     }
 
     private double permitsToTime(double permits) {
+      /**
+       *  slope = (coldIntervalMicros - stableIntervalMicros) / (maxPermits - thresholdPermits);
+       *
+       *  permits = (storedPermits - thresholdPermits;)
+       */
       return stableIntervalMicros + permits * slope;
     }
 
     @Override
     double coolDownIntervalMicros() {
+      //用生成这些许可的总时间除以现在已经生成的许可数，即可得到当前时间点平均一个许可的生成时间
       return warmupPeriodMicros / maxPermits;
     }
   }
@@ -288,16 +176,29 @@ abstract class SmoothRateLimiter extends RateLimiter {
    */
   static final class SmoothBursty extends SmoothRateLimiter {
     /** The work (permits) of how many seconds can be saved up if this RateLimiter is unused? */
+    /**
+     * 为允许的突发流量的时间，这里默认为 1.0，表示一秒，会影响最大可存储的许可数。
+     */
     final double maxBurstSeconds;
 
     SmoothBursty(SleepingStopwatch stopwatch, double maxBurstSeconds) {
       super(stopwatch);
+      /**
+       * maxBurstSeconds 为允许的突发流量的时间，这里默认为 1.0，表示一秒，会影响最大可存储的许可数。
+       */
       this.maxBurstSeconds = maxBurstSeconds;
     }
 
     @Override
     void doSetRate(double permitsPerSecond, double stableIntervalMicros) {
+      /**
+       *  double permitsPerSecond, 每秒的许可数
+       *  double stableIntervalMicros：稳定的获取一个许可的时间
+       */
+
+      // 初始化storedPermits 的值，该限速器支持在运行过程中动态改变 permitsPerSecond 的值。
       double oldMaxPermits = this.maxPermits;
+      //最大许可 = 允许的突发流量的时间 + 每秒的许可数
       maxPermits = maxBurstSeconds * permitsPerSecond;
       if (oldMaxPermits == Double.POSITIVE_INFINITY) {
         // if we don't special-case this, we would get storedPermits == NaN, below
@@ -323,6 +224,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
   /**
    * The currently stored permits.
+   *  当前可用的许可数量
    */
   double storedPermits;
 
@@ -340,6 +242,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
   /**
    * The time when the next request (no matter its size) will be granted. After granting a request,
    * this is pushed further in the future. Large requests push this further than small requests.
+   * 下一次可以免费获取许可的时间
    */
   private long nextFreeTicketMicros = 0L; // could be either in the past or future
 
@@ -349,9 +252,26 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
   @Override
   final void doSetRate(double permitsPerSecond, long nowMicros) {
+    /**
+     * double permitsPerSecond：每秒的许可数，即TPS。
+     * long nowMicros：统已运行时间。
+     */
+
+    /**
+     * 基于当前时间重置 SmoothRateLimiter 内部的 storedPermits(已存储的许可数量) 与 nextFreeTicketMicros(下一次可以免费获取许可的时间) 值，
+     * 所谓的免费指的是无需等待就可以获取设定速率的许可，
+     *    注意 SmoothBursty和SmoothWarmingUp的逻辑不完全一样
+     *
+     */
     resync(nowMicros);
+    /**
+     * 根据 TPS 算出一个稳定的获取1个许可的时间。以一秒发放5个许可，即限速为5TPS，那发放一个许可的时间间隔为 200ms，
+     * stableIntervalMicros 变量是以微妙为单位。
+     */
     double stableIntervalMicros = SECONDS.toMicros(1L) / permitsPerSecond;
     this.stableIntervalMicros = stableIntervalMicros;
+    //SmoothBursty.doSetRate
+    //SmoothWarmingUp.doSetRate
     doSetRate(permitsPerSecond, stableIntervalMicros);
   }
 
@@ -369,16 +289,41 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
   @Override
   final long reserveEarliestAvailable(int requiredPermits, long nowMicros) {
+    //在尝试申请许可之前，先根据当前时间即发放许可速率更新 storedPermits 与 nextFreeTicketMicros（下一次可以免费获取许可的时间）。
     resync(nowMicros);
+    //下一次可以免费获取许可的时间
     long returnValue = nextFreeTicketMicros;
+    //计算本次能从 storedPermits 中消耗的许可数量，取需要申请的许可数量与当前可用的许可数量（storedPermits）的最小值，用 storedPermitsToSpend 表示。
     double storedPermitsToSpend = min(requiredPermits, this.storedPermits);
+    //如果需要申请的许可数量( requiredPermits )大于当前剩余许可数量( storedPermits )，则还需要等待新的许可生成，
+    // 如果requiredPermits < storedPermits  则freshPermits = 0
+    // 如果 requiredPermits >  storedPermits   则freshPermits > 0 表示本次申请需要阻塞一定时间。
     double freshPermits = requiredPermits - storedPermitsToSpend;
+    /**
+     * 计算本次申请需要等待的时间，storedPermitsToWaitTime 方法在 SmoothBursty 的实现中默认返回 0，
+     * 即 SmoothBursty 的等待时间主要来自按照速率生成 freshPermits 个许可的时间，生成一个许可的时间为 stableIntervalMicros，
+     * 故需要等待的时长为 freshPermits * stableIntervalMicros。
+     *
+     *  SmoothBursty#storedPermitsToWaitTime()：返回0
+     *  SmoothWarmingUp#storedPermitsToWaitTime()：计算本次申请需要等待的时间，等待的时间由两部分组成，一部分是由 storedPermitsToWaitTime 方法返回的，
+     *  另外一部分以稳定速率生成需要的许可，其需要时间为 freshPermits * stableIntervalMicros
+     *
+     */
     long waitMicros =
         storedPermitsToWaitTime(this.storedPermits, storedPermitsToSpend)
             + (long) (freshPermits * stableIntervalMicros);
-
+    //更新 nextFreeTicketMicros 为当前时间加上需要等待的时间（freshPermits * stableIntervalMicros）。
+    //如果requiredPermits < storedPermits  nextFreeTicketMicros不变
+    //如果 requiredPermits >  storedPermits nextFreeTicketMicros延后
     this.nextFreeTicketMicros = LongMath.saturatedAdd(nextFreeTicketMicros, waitMicros);
+    //减少本次已消耗的许可数量
+    //如果 requiredPermits < storedPermits 则 storedPermits = storedPermits - requiredPermits
+    //如果 requiredPermits >  storedPermits 则 storedPermits = 0
     this.storedPermits -= storedPermitsToSpend;
+    /**
+     * 请注意这里返回的 returnValue 的值，并没有包含由于剩余许可需要等待创建新许可的时间，即允许一定的突发流量，
+     * 故本次计算需要的等待时间将对下一次请求生效，这也是框架作者将该限速器取名为 SmoothBursty 的缘由。
+     */
     return returnValue;
   }
 
@@ -400,10 +345,35 @@ abstract class SmoothRateLimiter extends RateLimiter {
    * Updates {@code storedPermits} and {@code nextFreeTicketMicros} based on the current time.
    */
   void resync(long nowMicros) {
+
+    /**
+     * 基于当前时间重置 SmoothRateLimiter 内部的 storedPermits (已存储的许可数量) 与
+     * nextFreeTicketMicros (下一次可以免费获取许可的时间) 值，所谓的免费指的是无需等待就可以获取设定速率的许可，
+     * 该方法对理解限流许可的产生非常关键，稍后详细介绍。
+     */
     // if nextFreeTicket is in the past, resync to now
+      //nextFreeTicketMicros：下一次可以免费获取许可的时间
+    /**
+     * 如果当前已启动时间大于 nextFreeTicketMicros（下一次可以免费获取许可的时间），则需要重新计算许可，即又可以向许可池中添加许可
+     */
     if (nowMicros > nextFreeTicketMicros) {
+      /**
+       * 1、SmoothBursty 的 coolDownIntervalMicros() ：
+       * 根据当前时间计算可增加的许可数量，在 SmoothBursty 的 coolDownIntervalMicros() 方法返回的是 stableIntervalMicros (发放一个许可所需要的时间)，
+       * 故本次可以增加的许可数的算法也好理解，即用当前时间戳减去 nextFreeTicketMicros 的差值，再除以发送一个许可所需要的时间即可。
+       *
+       * 2、SmoothWarmingUp.coolDownIntervalMicros()：
+       * 根据当前时间可增加的许可数量，由于 SmoothWarmingUp 实现了预热机制，平均生成一个许可的时间并不是固定不变的。
+       *  用生成这些许可的总时间 除以  现在已经生成的许可数，即可得到当前时间点平均一个许可的生成时间
+       *
+       */
+      //SmoothBursty.coolDownIntervalMicros() : 返回的是 stableIntervalMicros (发放一个许可所需要的时间)
+      //SmoothWarmingUp.coolDownIntervalMicros()   : warmupPeriodMicros / maxPermits;
       double newPermits = (nowMicros - nextFreeTicketMicros) / coolDownIntervalMicros();
+      //计算当前可用的许可，将新增的这些许可添加到许可池，但不会超过其最大值
       storedPermits = min(maxPermits, storedPermits + newPermits);
+      //更新下一次可增加计算许可的时间
+      //因为旧的nextFreeTicketMicros到nowMicros之间的许可已经增加了
       nextFreeTicketMicros = nowMicros;
     }
   }

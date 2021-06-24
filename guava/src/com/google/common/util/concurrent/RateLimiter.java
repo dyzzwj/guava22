@@ -134,8 +134,7 @@ public abstract class RateLimiter {
   static RateLimiter create(SleepingStopwatch stopwatch, double permitsPerSecond) {
     /**
      *   SleepingStopwatch stopwatch,秒表，主要是实现当前从启动开始已消耗的时间，有点类似计算一个操作耗时，实现精度纳秒
-     *   double permitsPerSecond : 每秒的许可数，即通常我们说的限流TPS。
-     *
+     *   double permitsPerSecond : 每秒的许可数，即通常我们说的限流TPS
      */
     RateLimiter rateLimiter = new SmoothBursty(stopwatch, 1.0 /* maxBurstSeconds */);
     //调用 setRate API 设置其速率器。
@@ -168,6 +167,11 @@ public abstract class RateLimiter {
    *     {@code warmupPeriod} is negative
    */
   public static RateLimiter create(double permitsPerSecond, long warmupPeriod, TimeUnit unit) {
+    /**
+     * double permitsPerSecond：每秒发放许可数量，即所谓的QPS。
+     * long warmupPeriod：设置预热时间。
+     * TimeUnit unit：warmupPeriod 的时间单位。
+     */
     checkArgument(warmupPeriod >= 0, "warmupPeriod must not be negative: %s", warmupPeriod);
     return create(
         SleepingStopwatch.createFromSystemTimer(), permitsPerSecond, warmupPeriod, unit, 3.0);
@@ -180,7 +184,10 @@ public abstract class RateLimiter {
       long warmupPeriod,
       TimeUnit unit,
       double coldFactor) {
+
+    //coldFactor，默认为 3.0
     RateLimiter rateLimiter = new SmoothWarmingUp(stopwatch, warmupPeriod, unit, coldFactor);
+    //最终会调用其父类 SmoothRateLimiter 的doSetRate 方法
     rateLimiter.setRate(permitsPerSecond);
     return rateLimiter;
   }
@@ -232,7 +239,9 @@ public abstract class RateLimiter {
   public final void setRate(double permitsPerSecond) {
     checkArgument(
         permitsPerSecond > 0.0 && !Double.isNaN(permitsPerSecond), "rate must be positive");
+    //mutex()：该方法需要获取该类的监视器，在同步代码块中执行，实现线程安全性
     synchronized (mutex()) {
+      //SmoothRateLimiter 的 doSetRate
       doSetRate(permitsPerSecond, stopwatch.readMicros());
     }
   }
@@ -278,8 +287,13 @@ public abstract class RateLimiter {
    */
   @CanIgnoreReturnValue
   public double acquire(int permits) {
+    /**
+     * 根据当前剩余的许可与本次申请的许可来判断本次申请需要等待的时长，如果返回0则表示无需等待
+     */
     long microsToWait = reserve(permits);
+    //如果需要等待的时间大于0，表示触发限速，睡眠指定时间后唤醒。
     stopwatch.sleepMicrosUninterruptibly(microsToWait);
+    //返回本次申请等待的时长。
     return 1.0 * microsToWait / SECONDS.toMicros(1L);
   }
 
@@ -291,7 +305,21 @@ public abstract class RateLimiter {
    */
   final long reserve(int permits) {
     checkPermits(permits);
+    //限速器主要维护的重要数据字段( storedPermits )，对其进行维护时都需要先获取锁。
     synchronized (mutex()) {
+      //调用内部方法 reserveAndGetWaitLength 来计算需要等待时间。
+      /**
+       * 这里什么情况下 需要sleep
+       *     如果  nowMicros < nextFreeTicketMicros(下一次可以免费获取许可的时间)
+       *            如果需要申请的许可数量( requiredPermits )大于当前剩余许可数量( storedPermits )  此方法返回大于0（需要sleep）
+       *     如果  nowMicros > nextFreeTicketMicros(下一次可以免费获取许可的时间)
+       *            如果需要申请的许可数量( requiredPermits )大于当前剩余许可数量( storedPermits )  此方法返回等于0（不需要sleep）
+       *     即允许一定的突发流量，
+       *      * 故本次计算需要的等待时间将对下一次请求生效，这也是框架作者将该限速器取名为 SmoothBursty 的缘由
+       *
+       *      注意：当一个请求需要申请的许可大于 storedPermits 时，则计算需要等待的时间，更新下一次许可可发放时间，直接返回，
+       *      即当请求消耗掉所有许可后，当前请求并不会阻塞，而是影响下一个请求，即支持突发流量。
+       */
       return reserveAndGetWaitLength(permits, stopwatch.readMicros());
     }
   }
@@ -376,7 +404,23 @@ public abstract class RateLimiter {
    * @return the required wait time, never negative
    */
   final long reserveAndGetWaitLength(int permits, long nowMicros) {
+    /**
+     * 根据当前拥有的许可数量、当前时间判断待申请许可最早能得到满足的最早时间，用momentAvailable 表示。
+     */
+    //SmoothRateLimiter.reserveEarliestAvailable
     long momentAvailable = reserveEarliestAvailable(permits, nowMicros);
+    //然后计算 momentAvailable 与 nowMicros 的差值与0做比较，得出需要等待的时间。
+
+    /**
+     * 这里什么情况下  momentAvailable > nowMicros
+     *     如果  nowMicros < nextFreeTicketMicros(下一次可以免费获取许可的时间)
+     *            如果需要申请的许可数量( requiredPermits )大于当前剩余许可数量( storedPermits )  此方法返回大于0（需要sleep）
+     *     如果  nowMicros > nextFreeTicketMicros(下一次可以免费获取许可的时间)
+     *            如果需要申请的许可数量( requiredPermits )大于当前剩余许可数量( storedPermits )  此方法返回等于0（不需要sleep）
+     *      即允许一定的突发流量，
+     *      故本次计算需要的等待时间将对下一次请求生效，这也是框架作者将该限速器取名为 SmoothBursty 的缘由
+     *
+     */
     return max(momentAvailable - nowMicros, 0);
   }
 
