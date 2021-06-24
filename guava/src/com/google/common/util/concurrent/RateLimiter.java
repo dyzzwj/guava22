@@ -132,7 +132,13 @@ public abstract class RateLimiter {
    */
   @VisibleForTesting
   static RateLimiter create(SleepingStopwatch stopwatch, double permitsPerSecond) {
+    /**
+     *   SleepingStopwatch stopwatch,秒表，主要是实现当前从启动开始已消耗的时间，有点类似计算一个操作耗时，实现精度纳秒
+     *   double permitsPerSecond : 每秒的许可数，即通常我们说的限流TPS。
+     *
+     */
     RateLimiter rateLimiter = new SmoothBursty(stopwatch, 1.0 /* maxBurstSeconds */);
+    //调用 setRate API 设置其速率器。
     rateLimiter.setRate(permitsPerSecond);
     return rateLimiter;
   }

@@ -50,6 +50,7 @@ public class RateLimiterTest extends TestCase {
 
   public void testSimple() {
     RateLimiter limiter = RateLimiter.create(stopwatch, 5.0);
+    //申请许可
     limiter.acquire(); // R0.00, since it's the first request
     limiter.acquire(); // R0.20
     limiter.acquire(); // R0.20
